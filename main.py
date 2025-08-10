@@ -6,7 +6,6 @@ Endpoints:
  - POST /api/attendee/{attendee_id}/mark -> mark attendance (requires scanner auth)
 Config via environment variables (see README below).
 """
-
 import os
 import json
 from typing import Optional
@@ -22,23 +21,24 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
 # --- Config from env ---
-MONGO_URI = os.environ.get("MONGO_URI")
-MONGO_DB = os.environ.get("MONGO_DB_NAME", "event_tickets")
-MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION_NAME", "attendees")
+MONGO_URI = os.getenv("MONGO_URI")
+client = MongoClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=True)
+MONGO_DB = client["ticket_admin"]
+MONGO_COLLECTION = MONGO_DB["DHyefCvOk28GyaVN"]
 
 # Simple scanner auth (set these as env vars on the server)
-SCANNER_ID = os.environ.get("SCANNER_ID", "scanner1")
-SCANNER_PASSWORD = os.environ.get("SCANNER_PASSWORD", "password123")
+SCANNER_ID = os.getenv("SCANNER_ID", "scanner1")
+SCANNER_PASSWORD = os.getenv("SCANNER_PASSWORD", "password123")
 
 # Google sheets optional settings
-GOOGLE_SA_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")  # JSON content, not path
-SHEETS_SPREADSHEET_ID = os.environ.get("SHEETS_SPREADSHEET_ID")  # e.g. 1_xxx...
-SHEETS_TAB_NAME = os.environ.get("SHEETS_TAB_NAME", "Form_Responses_1")
-SHEETS_ATTENDANCE_COL = os.environ.get("SHEETS_ATTENDANCE_COL", "L")  # column letter to write attendance status
-UPDATE_SHEETS_ON_MARK = os.environ.get("UPDATE_SHEETS_ON_MARK", "false").lower() in ("1","true","yes")
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")  # JSON content, not path
+SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")  # e.g. 1_xxx...
+SHEETS_TAB_NAME = os.getenv("SHEETS_TAB_NAME", "Form_Responses_1")
+SHEETS_ATTENDANCE_COL = os.getenv("SHEETS_ATTENDANCE_COL", "L")  # column letter to write attendance status
+UPDATE_SHEETS_ON_MARK = os.getenv("UPDATE_SHEETS_ON_MARK", "false").lower() in ("1","true","yes")
 
 # CORS origins (mobile app URL / wildcard during dev)
-CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*").split(",")  # comma-separated
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")  # comma-separated
 
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI environment variable must be set")
