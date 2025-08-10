@@ -45,8 +45,8 @@ if not MONGO_URI:
 
 # --- Mongo client ---
 mongo_client = MongoClient(MONGO_URI)
-db = mongo_client[MONGO_DB]
-collection = db[MONGO_COLLECTION]
+db = MONGO_DB
+collection = MONGO_COLLECTION
 
 # --- Optional Google Sheets client factory ---
 def build_sheets_service():
