@@ -4,141 +4,140 @@ FastAPI backend for ticket scanner app.
 Endpoints:
  - GET  /api/attendee/{attendee_id}      -> fetch attendee from MongoDB
  - POST /api/attendee/{attendee_id}/mark -> mark attendance (requires scanner auth)
-Config via environment variables (see README below).
+Config via environment variables.
 """
 import os
 import json
-
-from dotenv import load_dotenv # <--- IMPORT THE FUNCTION
-
-load_dotenv() # <--- ADD THIS LINE TO LOAD THE .ENV FILE
-
+from dotenv import load_dotenv
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime
 from pymongo import MongoClient
-from bson import ObjectId
 
-# Optional Google Sheets
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
+# Load environment variables from a .env file for local development
+load_dotenv()
 
-# --- Config from env ---
+# --- Configuration from Environment Variables ---
+
+# MongoDB connection details (now fully dynamic)
 MONGO_URI = os.getenv("MONGO_URI")
-client = MongoClient(MONGO_URI, tls=True, tlsAllowInvalidCertificates=True)
-MONGO_DB = client["ticket_admin"]
-MONGO_COLLECTION = MONGO_DB["DHyefCvOk28GyaVN"]
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME")
+MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME")
 
-# Simple scanner auth (set these as env vars on the server)
-SCANNER_ID = os.getenv("SCANNER_ID", "scanner1")
-SCANNER_PASSWORD = os.getenv("SCANNER_PASSWORD", "password123")
+# Scanner credentials (required)
+SCANNER_ID = os.getenv("SCANNER_ID")
+SCANNER_PASSWORD = os.getenv("SCANNER_PASSWORD")
 
-# Google sheets optional settings
-GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")  # JSON content, not path
-SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")  # e.g. 1_xxx...
+# Google Sheets integration (optional)
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")
 SHEETS_TAB_NAME = os.getenv("SHEETS_TAB_NAME", "Form_Responses_1")
+UPDATE_SHEETS_ON_MARK = os.getenv("UPDATE_SHEETS_ON_MARK", "false").lower() in ("true", "1", "yes")
 
-UPDATE_SHEETS_ON_MARK = os.getenv("UPDATE_SHEETS_ON_MARK", "false").lower() in ("1","true","yes")
+# CORS origins for the mobile app
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 
-# CORS origins (mobile app URL / wildcard during dev)
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")  # comma-separated
-
+# --- Critical Configuration Checks ---
+# The application will not start if these required variables are missing.
 if not MONGO_URI:
-    raise RuntimeError("MONGO_URI environment variable must be set")
+    raise RuntimeError("FATAL: MONGO_URI environment variable must be set.")
+if not MONGO_DB_NAME:
+    raise RuntimeError("FATAL: MONGO_DB_NAME environment variable must be set.")
+if not MONGO_COLLECTION_NAME:
+    raise RuntimeError("FATAL: MONGO_COLLECTION_NAME environment variable must be set.")
+if not SCANNER_ID or not SCANNER_PASSWORD:
+    raise RuntimeError("FATAL: SCANNER_ID and SCANNER_PASSWORD environment variables must be set.")
 
-# --- Mongo client ---
-mongo_client = MongoClient(MONGO_URI)
-db = MONGO_DB
-collection = MONGO_COLLECTION
+# --- Database Client Initialization ---
+try:
+    client = MongoClient(MONGO_URI)
+    db = client[MONGO_DB_NAME]
+    collection = db[MONGO_COLLECTION_NAME]
+    # Test the connection
+    client.admin.command('ping')
+    print("✅ MongoDB connection successful.")
+except Exception as e:
+    raise RuntimeError(f"❌ Could not connect to MongoDB: {e}")
 
-# --- Optional Google Sheets client factory ---
+
+# --- Optional Google Sheets Service ---
+# This section is for initializing the Google Sheets API if credentials are provided.
 def build_sheets_service():
-    """
-    Builds a Google Sheets service if GOOGLE_SERVICE_ACCOUNT_JSON is provided.
-    GOOGLE_SERVICE_ACCOUNT_JSON should be the full JSON string of the service account.
-    """
+    """Builds and returns a Google Sheets service client if configured."""
     if not GOOGLE_SA_JSON:
         return None
     try:
+        # These imports are here so they are not required if not using Google Sheets
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+
         cred_dict = json.loads(GOOGLE_SA_JSON)
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_info(cred_dict, scopes=scopes)
         service = build("sheets", "v4", credentials=creds)
+        print("✅ Google Sheets service initialized.")
         return service
-    except json.JSONDecodeError:
-        print("❌ ERROR: GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.")
+    except Exception as e:
+        print(f"⚠️ Warning: Could not initialize Google Sheets service: {e}")
         return None
-
 
 sheets_service = build_sheets_service()
 
-# --- FastAPI app ---
+# --- FastAPI Application Setup ---
 app = FastAPI(title="Ticket Scanner Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS if CORS_ORIGINS != ["*"] else ["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-
-# --- Pydantic models ---
+# --- Pydantic Models for API Requests ---
 class MarkRequest(BaseModel):
     scanner_id: str
     scanner_password: str
-    meta: Optional[dict] = None  # optional metadata, e.g. location, device id
+    meta: Optional[dict] = None
 
-
-# --- Helpers ---
+# --- Helper Functions ---
 def attendee_doc_to_dict(doc):
-    """Convert Mongo document to JSON-serializable dict."""
+    """Converts a MongoDB document to a JSON-serializable dictionary."""
     if not doc:
         return None
     out = {k: v for k, v in doc.items() if k != "_id"}
     out["id"] = str(doc.get("attendee_id") or doc.get("_id"))
     return out
 
-# --- MODIFIED: Removed detailed debugging logs ---
-def update_google_sheet_mark(attendee_id, mark_value="Attended"):
-    """Optional: update Google Sheet by searching for attendee_id and marking attendance."""
+def update_google_sheet_mark(attendee_id: str, mark_value: str = "Attended") -> bool:
+    """Updates the 'Attendance' column in Google Sheets for a given attendee ID."""
     if not sheets_service or not SHEETS_SPREADSHEET_ID:
         return False
     
     try:
-        # Read the entire sheet to find the header and the data
         range_all = f"{SHEETS_TAB_NAME}!A:Z"
         result = sheets_service.spreadsheets().values().get(spreadsheetId=SHEETS_SPREADSHEET_ID, range=range_all).execute()
         rows = result.get("values", [])
-        
         if not rows:
             return False
         
         header = rows[0]
         data_rows = rows[1:]
 
-        # Find the index of the required columns dynamically
-        try:
-            id_col_index = header.index("Attendee ID")
-            attendance_col_index = header.index("Attendance")
-        except ValueError as e:
-            print(f"Critical Error: A required column was not found in the sheet header - {e}")
-            return False
+        id_col_index = header.index("Attendee ID")
+        attendance_col_index = header.index("Attendance")
 
-        # Find the row that matches the attendee_id
         row_index = -1
         for idx, row in enumerate(data_rows):
             if len(row) > id_col_index and row[id_col_index] == attendee_id:
-                row_index = idx + 2 
+                row_index = idx + 2
                 break
         
         if row_index == -1:
             return False
 
-        # Convert the numeric column index to a letter (A, B, C...)
         attendance_col_letter = chr(ord('A') + attendance_col_index)
         range_to_write = f"{SHEETS_TAB_NAME}!{attendance_col_letter}{row_index}"
         
@@ -150,32 +149,22 @@ def update_google_sheet_mark(attendee_id, mark_value="Attended"):
         ).execute()
         
         return True
-
     except Exception as e:
         print(f"❌ An exception occurred during sheet update: {e}")
         return False
 
-
-# --- Endpoints ---
+# --- API Endpoints ---
 @app.get("/api/attendee/{attendee_id}")
 def get_attendee(attendee_id: str):
-    """
-    Fetch attendee by attendee_id (the UUID stored in QR).
-    Returns 404 if not found.
-    """
+    """Fetches attendee details from the database."""
     doc = collection.find_one({"attendee_id": attendee_id})
     if not doc:
         raise HTTPException(status_code=404, detail="Attendee not found")
     return attendee_doc_to_dict(doc)
 
-
 @app.post("/api/attendee/{attendee_id}/mark")
 def mark_attendance(attendee_id: str, req: MarkRequest):
-    """
-    Mark attendance for an attendee.
-    Requires scanner credentials in POST body (scanner_id, scanner_password).
-    """
-    # Basic auth check
+    """Marks an attendee as present, updating the sheet first, then the database."""
     if req.scanner_id != SCANNER_ID or req.scanner_password != SCANNER_PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid scanner credentials")
 
@@ -183,62 +172,25 @@ def mark_attendance(attendee_id: str, req: MarkRequest):
     if not doc:
         raise HTTPException(status_code=404, detail="Attendee not found")
 
-    # Barrier check to prevent re-using a ticket
     if doc.get("attendance_status") == "Attended":
-        raise HTTPException(
-            status_code=409, # HTTP 409 Conflict
-            detail=f"Ticket already used. Marked at: {doc.get('attendance_ts', 'N/A')}"
-        )
+        raise HTTPException(status_code=409, detail=f"Ticket already used at {doc.get('attendance_ts', 'N/A')}")
 
-    # --- MODIFIED: Transactional update logic ---
-    # This section now ensures the database is only updated *after* the sheet is marked.
-    
-    # Case 1: Sheet updates are disabled. Update the database directly.
-    if not UPDATE_SHEETS_ON_MARK:
-        update = {
-            "attendance_status": "Attended",
-            "attendance_ts": datetime.utcnow().isoformat(),
-        }
-        if req.meta:
-            update["attendance_meta"] = req.meta
-        collection.update_one({"attendee_id": attendee_id}, {"$set": update})
-        return {
-            "ok": True,
-            "message": "Attendance marked in Database (sheet update was disabled)",
-            "sheet_updated": False
-        }
-
-    # Case 2: Sheet updates are enabled. Attempt sheet update first.
-    try:
-        sheet_updated = update_google_sheet_mark(attendee_id, mark_value="Attended")
-
-        # If the sheet update fails, abort the operation.
+    if UPDATE_SHEETS_ON_MARK:
+        sheet_updated = update_google_sheet_mark(attendee_id)
         if not sheet_updated:
-            return {
-                "ok": False,
-                "message": "Failed to update Google Sheet. Attendance not marked.",
-                "sheet_updated": False
-            }
+            return {"ok": False, "message": "Failed to update Google Sheet. Attendance not marked.", "sheet_updated": False}
 
-        # If sheet update succeeds, now update the database.
-        update = {
-            "attendance_status": "Attended",
-            "attendance_ts": datetime.utcnow().isoformat(),
-        }
-        if req.meta:
-            update["attendance_meta"] = req.meta
-        collection.update_one({"attendee_id": attendee_id}, {"$set": update})
+    update_data = {
+        "attendance_status": "Attended",
+        "attendance_ts": datetime.utcnow().isoformat(),
+    }
+    if req.meta:
+        update_data["attendance_meta"] = req.meta
+    
+    collection.update_one({"attendee_id": attendee_id}, {"$set": update_data})
 
-        return {
-            "ok": True,
-            "message": "Attendance marked successfully in Sheet and Database.",
-            "sheet_updated": True
-        }
-
-    except Exception as e:
-        print(f"❌ An unexpected error occurred in the mark_attendance endpoint: {e}")
-        return {
-            "ok": False,
-            "message": f"An unexpected error occurred: {e}",
-            "sheet_updated": False
-        }
+    return {
+        "ok": True,
+        "message": "Attendance marked successfully.",
+        "sheet_updated": UPDATE_SHEETS_ON_MARK and sheet_updated
+    }
