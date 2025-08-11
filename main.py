@@ -157,6 +157,7 @@ def update_google_sheet_mark(attendee_id: str, mark_value: str = "Attended") -> 
 
 # --- API Endpoints ---
 
+# --- NEW: Login endpoint ---
 @app.post("/api/login")
 def login(req: LoginRequest):
     """Validates scanner credentials."""
