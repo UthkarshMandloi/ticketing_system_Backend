@@ -157,7 +157,6 @@ def update_google_sheet_mark(attendee_id: str, mark_value: str = "Attended") -> 
 
 # --- API Endpoints ---
 
-# --- NEW: Login endpoint ---
 @app.post("/api/login")
 def login(req: LoginRequest):
     """Validates scanner credentials."""
@@ -168,7 +167,8 @@ def login(req: LoginRequest):
 @app.get("/api/attendees")
 def get_all_attendees():
     """Fetches a list of all attendees from the database."""
-    docs = collection.find({}, {"name": 1, "attendee_id": 1, "attendance_status": 1, "_id": 0})
+    # --- FIX: Changed "name" to "Name" to match the database key ---
+    docs = collection.find({}, {"Name": 1, "attendee_id": 1, "attendance_status": 1, "_id": 0})
     return list(docs)
 
 @app.get("/api/attendee/{attendee_id}")
