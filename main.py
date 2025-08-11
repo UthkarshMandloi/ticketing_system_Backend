@@ -8,6 +8,11 @@ Config via environment variables (see README below).
 """
 import os
 import json
+
+from dotenv import load_dotenv # <--- IMPORT THE FUNCTION
+
+load_dotenv() # <--- ADD THIS LINE TO LOAD THE .ENV FILE
+
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,7 +39,7 @@ SCANNER_PASSWORD = os.getenv("SCANNER_PASSWORD", "password123")
 GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")  # JSON content, not path
 SHEETS_SPREADSHEET_ID = os.getenv("SHEETS_SPREADSHEET_ID")  # e.g. 1_xxx...
 SHEETS_TAB_NAME = os.getenv("SHEETS_TAB_NAME", "Form_Responses_1")
-SHEETS_ATTENDANCE_COL = os.getenv("SHEETS_ATTENDANCE_COL", "L")  # column letter to write attendance status
+
 UPDATE_SHEETS_ON_MARK = os.getenv("UPDATE_SHEETS_ON_MARK", "false").lower() in ("1","true","yes")
 
 # CORS origins (mobile app URL / wildcard during dev)
@@ -56,11 +61,16 @@ def build_sheets_service():
     """
     if not GOOGLE_SA_JSON:
         return None
-    cred_dict = json.loads(GOOGLE_SA_JSON)
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(cred_dict, scopes=scopes)
-    service = build("sheets", "v4", credentials=creds)
-    return service
+    try:
+        cred_dict = json.loads(GOOGLE_SA_JSON)
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_info(cred_dict, scopes=scopes)
+        service = build("sheets", "v4", credentials=creds)
+        return service
+    except json.JSONDecodeError:
+        print("❌ ERROR: GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.")
+        return None
+
 
 sheets_service = build_sheets_service()
 
@@ -92,34 +102,57 @@ def attendee_doc_to_dict(doc):
     out["id"] = str(doc.get("attendee_id") or doc.get("_id"))
     return out
 
+# --- MODIFIED: Removed detailed debugging logs ---
 def update_google_sheet_mark(attendee_id, mark_value="Attended"):
-    """Optional: update Google Sheet by searching for attendee_id in sheet and writing attendance."""
+    """Optional: update Google Sheet by searching for attendee_id and marking attendance."""
     if not sheets_service or not SHEETS_SPREADSHEET_ID:
         return False
+    
     try:
-        # Read all rows
+        # Read the entire sheet to find the header and the data
         range_all = f"{SHEETS_TAB_NAME}!A:Z"
         result = sheets_service.spreadsheets().values().get(spreadsheetId=SHEETS_SPREADSHEET_ID, range=range_all).execute()
         rows = result.get("values", [])
+        
         if not rows:
             return False
-        # Find header and locate attendee id column if applicable; here we search by attendee_id in any cell
-        found = False
-        for idx, row in enumerate(rows[1:], start=2):  # skip header, rows indexed 1-based
-            if attendee_id in row:
-                # write mark_value into configured column
-                range_to_write = f"{SHEETS_TAB_NAME}!{SHEETS_ATTENDANCE_COL}{idx}"
-                sheets_service.spreadsheets().values().update(
-                    spreadsheetId=SHEETS_SPREADSHEET_ID,
-                    range=range_to_write,
-                    valueInputOption="RAW",
-                    body={"values": [[mark_value]]}
-                ).execute()
-                found = True
+        
+        header = rows[0]
+        data_rows = rows[1:]
+
+        # Find the index of the required columns dynamically
+        try:
+            id_col_index = header.index("Attendee ID")
+            attendance_col_index = header.index("Attendance")
+        except ValueError as e:
+            print(f"Critical Error: A required column was not found in the sheet header - {e}")
+            return False
+
+        # Find the row that matches the attendee_id
+        row_index = -1
+        for idx, row in enumerate(data_rows):
+            if len(row) > id_col_index and row[id_col_index] == attendee_id:
+                row_index = idx + 2 
                 break
-        return found
+        
+        if row_index == -1:
+            return False
+
+        # Convert the numeric column index to a letter (A, B, C...)
+        attendance_col_letter = chr(ord('A') + attendance_col_index)
+        range_to_write = f"{SHEETS_TAB_NAME}!{attendance_col_letter}{row_index}"
+        
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=SHEETS_SPREADSHEET_ID,
+            range=range_to_write,
+            valueInputOption="RAW",
+            body={"values": [[mark_value]]}
+        ).execute()
+        
+        return True
+
     except Exception as e:
-        print("Error updating Google Sheet:", e)
+        print(f"❌ An exception occurred during sheet update: {e}")
         return False
 
 
@@ -150,26 +183,62 @@ def mark_attendance(attendee_id: str, req: MarkRequest):
     if not doc:
         raise HTTPException(status_code=404, detail="Attendee not found")
 
-    # Update DB: set attendance_status and attendance_ts
-    update = {
-        "attendance_status": "Attended",
-        "attendance_ts": datetime.utcnow().isoformat(),
-    }
-    if req.meta:
-        update["attendance_meta"] = req.meta
+    # Barrier check to prevent re-using a ticket
+    if doc.get("attendance_status") == "Attended":
+        raise HTTPException(
+            status_code=409, # HTTP 409 Conflict
+            detail=f"Ticket already used. Marked at: {doc.get('attendance_ts', 'N/A')}"
+        )
 
-    collection.update_one({"attendee_id": attendee_id}, {"$set": update})
+    # --- MODIFIED: Transactional update logic ---
+    # This section now ensures the database is only updated *after* the sheet is marked.
+    
+    # Case 1: Sheet updates are disabled. Update the database directly.
+    if not UPDATE_SHEETS_ON_MARK:
+        update = {
+            "attendance_status": "Attended",
+            "attendance_ts": datetime.utcnow().isoformat(),
+        }
+        if req.meta:
+            update["attendance_meta"] = req.meta
+        collection.update_one({"attendee_id": attendee_id}, {"$set": update})
+        return {
+            "ok": True,
+            "message": "Attendance marked in Database (sheet update was disabled)",
+            "sheet_updated": False
+        }
 
-    # Optionally update Google Sheet
-    sheet_updated = False
-    if UPDATE_SHEETS_ON_MARK:
-        try:
-            sheet_updated = update_google_sheet_mark(attendee_id, mark_value="Attended")
-        except Exception as e:
-            print("Error updating sheet:", e)
+    # Case 2: Sheet updates are enabled. Attempt sheet update first.
+    try:
+        sheet_updated = update_google_sheet_mark(attendee_id, mark_value="Attended")
 
-    return {
-        "ok": True,
-        "message": "Attendance marked",
-        "sheet_updated": sheet_updated
-    }
+        # If the sheet update fails, abort the operation.
+        if not sheet_updated:
+            return {
+                "ok": False,
+                "message": "Failed to update Google Sheet. Attendance not marked.",
+                "sheet_updated": False
+            }
+
+        # If sheet update succeeds, now update the database.
+        update = {
+            "attendance_status": "Attended",
+            "attendance_ts": datetime.utcnow().isoformat(),
+        }
+        if req.meta:
+            update["attendance_meta"] = req.meta
+        collection.update_one({"attendee_id": attendee_id}, {"$set": update})
+
+        return {
+            "ok": True,
+            "message": "Attendance marked successfully in Sheet and Database.",
+            "sheet_updated": True
+        }
+
+    except Exception as e:
+        print(f"❌ An unexpected error occurred in the mark_attendance endpoint: {e}")
+        return {
+            "ok": False,
+            "message": f"An unexpected error occurred: {e}",
+            "sheet_updated": False
+        }
