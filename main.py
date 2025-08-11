@@ -2,14 +2,16 @@
 """
 FastAPI backend for ticket scanner app.
 Endpoints:
- - GET  /api/attendee/{attendee_id}      -> fetch attendee from MongoDB
- - POST /api/attendee/{attendee_id}/mark -> mark attendance (requires scanner auth)
+ - GET  /api/attendees                   -> fetch all attendees
+ - POST /api/login                       -> validate scanner credentials
+ - GET  /api/attendee/{attendee_id}      -> fetch a single attendee
+ - POST /api/attendee/{attendee_id}/mark -> mark attendance
 Config via environment variables.
 """
 import os
 import json
 from dotenv import load_dotenv
-from typing import Optional
+from typing import Optional, List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -63,13 +65,11 @@ except Exception as e:
 
 
 # --- Optional Google Sheets Service ---
-# This section is for initializing the Google Sheets API if credentials are provided.
 def build_sheets_service():
     """Builds and returns a Google Sheets service client if configured."""
     if not GOOGLE_SA_JSON:
         return None
     try:
-        # These imports are here so they are not required if not using Google Sheets
         from google.oauth2.service_account import Credentials
         from googleapiclient.discovery import build
 
@@ -97,6 +97,10 @@ app.add_middleware(
 )
 
 # --- Pydantic Models for API Requests ---
+class LoginRequest(BaseModel):
+    scanner_id: str
+    scanner_password: str
+
 class MarkRequest(BaseModel):
     scanner_id: str
     scanner_password: str
@@ -120,8 +124,7 @@ def update_google_sheet_mark(attendee_id: str, mark_value: str = "Attended") -> 
         range_all = f"{SHEETS_TAB_NAME}!A:Z"
         result = sheets_service.spreadsheets().values().get(spreadsheetId=SHEETS_SPREADSHEET_ID, range=range_all).execute()
         rows = result.get("values", [])
-        if not rows:
-            return False
+        if not rows: return False
         
         header = rows[0]
         data_rows = rows[1:]
@@ -135,8 +138,7 @@ def update_google_sheet_mark(attendee_id: str, mark_value: str = "Attended") -> 
                 row_index = idx + 2
                 break
         
-        if row_index == -1:
-            return False
+        if row_index == -1: return False
 
         attendance_col_letter = chr(ord('A') + attendance_col_index)
         range_to_write = f"{SHEETS_TAB_NAME}!{attendance_col_letter}{row_index}"
@@ -154,13 +156,29 @@ def update_google_sheet_mark(attendee_id: str, mark_value: str = "Attended") -> 
         return False
 
 # --- API Endpoints ---
+
+@app.post("/api/login")
+def login(req: LoginRequest):
+    """Validates scanner credentials."""
+    if req.scanner_id == SCANNER_ID and req.scanner_password == SCANNER_PASSWORD:
+        return {"ok": True, "message": "Login successful"}
+    raise HTTPException(status_code=401, detail="Invalid scanner credentials")
+
+@app.get("/api/attendees")
+def get_all_attendees():
+    """Fetches a list of all attendees from the database."""
+    docs = collection.find({}, {"name": 1, "attendee_id": 1, "attendance_status": 1, "_id": 0})
+    return list(docs)
+
 @app.get("/api/attendee/{attendee_id}")
 def get_attendee(attendee_id: str):
-    """Fetches attendee details from the database."""
-    doc = collection.find_one({"attendee_id": attendee_id})
+    """Fetches full details for a single attendee from the database."""
+    # Exclude fields that are not needed on the details screen
+    projection = {"_id": 0, "Timestamp": 0, "Ticket Status": 0, "Email Status": 0}
+    doc = collection.find_one({"attendee_id": attendee_id}, projection)
     if not doc:
         raise HTTPException(status_code=404, detail="Attendee not found")
-    return attendee_doc_to_dict(doc)
+    return doc
 
 @app.post("/api/attendee/{attendee_id}/mark")
 def mark_attendance(attendee_id: str, req: MarkRequest):
