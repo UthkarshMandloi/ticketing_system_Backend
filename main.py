@@ -11,7 +11,7 @@ Config via environment variables.
 import os
 import json
 from dotenv import load_dotenv
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -194,12 +194,13 @@ def mark_attendance(attendee_id: str, req: MarkRequest):
     if doc.get("attendance_status") == "Attended":
         raise HTTPException(status_code=409, detail=f"Ticket already used at {doc.get('attendance_ts', 'N/A')}")
 
+    sheet_updated = False
     if UPDATE_SHEETS_ON_MARK:
         sheet_updated = update_google_sheet_mark(attendee_id)
         if not sheet_updated:
             return {"ok": False, "message": "Failed to update Google Sheet. Attendance not marked.", "sheet_updated": False}
 
-    update_data = {
+    update_data: Dict[str, Any] = {
         "attendance_status": "Attended",
         "attendance_ts": datetime.utcnow().isoformat(),
     }
@@ -207,9 +208,69 @@ def mark_attendance(attendee_id: str, req: MarkRequest):
         update_data["attendance_meta"] = req.meta
     
     collection.update_one({"attendee_id": attendee_id}, {"$set": update_data})
-
     return {
         "ok": True,
         "message": "Attendance marked successfully.",
-        "sheet_updated": UPDATE_SHEETS_ON_MARK and sheet_updated
+        "sheet_updated": sheet_updated
     }
+
+
+
+# --- API Endpoints ---
+
+@app.get("/api/stats")
+def get_attendance_stats():
+    """Calculates and returns attendance statistics."""
+    try:
+        total_attendees = collection.count_documents({})
+        attended_count = collection.count_documents({"attendance_status": "Attended"})
+        absent_count = total_attendees - attended_count
+        
+        return {
+            "total_entries": total_attendees,
+            "total_attended": attended_count,
+            "total_absent": absent_count
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred while fetching stats: {e}")
+    
+@app.get("/api/stats/by-branch")
+def get_branch_stats():
+    """Calculates and returns attendance statistics grouped by branch."""
+    try:
+        pipeline = [
+            {
+                "$group": {
+                    "_id": "$Branch",  # Group by the 'Branch' field
+                    "total_members": {"$sum": 1},
+                    "total_attended": {
+                        "$sum": {
+                            "$cond": [{"$eq": ["$attendance_status", "Attended"]}, 1, 0]
+                        }
+                    }
+                }
+            },
+            {
+                "$project": {
+                    "branch": "$_id",
+                    "total_members": "$total_members",
+                    "total_attended": "$total_attended",
+                    "total_absent": {"$subtract": ["$total_members", "$total_attended"]},
+                    "_id": 0
+                }
+            },
+            {
+                "$sort": {"branch": 1} # Sort alphabetically by branch name
+            }
+        ]
+            
+        stats = list(collection.aggregate(pipeline))
+            
+        # Handle cases where a branch might be null or empty
+        for stat in stats:
+            if not stat["branch"]:
+                stat["branch"] = "Unknown"
+
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred while fetching branch stats: {e}")
